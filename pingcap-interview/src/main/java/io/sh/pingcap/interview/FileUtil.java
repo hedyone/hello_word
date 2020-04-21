@@ -5,20 +5,22 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class FileUtil {
 
     private  static  HashMap<String, Long> cacheMap = new HashMap<String, Long>();
 
     /**
-     * 单线程分割文件，这里使用单线程处理，可以使用更大的内存hash表，从而获得更高的预聚合，减少了输出到文件的数据量；
+     * split file with single thread
      * @param sourceFilePath
      * @param aviableMemerySize
      * @param destDirName
      */
     public static void splitFile(String sourceFilePath, long aviableMemerySize, String destDirName) {
+
         File  soureFile = new File(sourceFilePath);
-        String sourceFileParent = soureFile.getParent();
         String fileSplitDir =  destDirName;
         File destDir = new File(fileSplitDir);
         if (destDir.exists()) {
@@ -26,13 +28,12 @@ public class FileUtil {
         }
         destDir.mkdirs();
 
-        //计算分片文件数量
         long fileLength = soureFile.length();
-        System.out.println( sourceFilePath + " split to " + fileLength +" files");
-        //预留10%的空间给应用程序
-        final double hashMapLimit =  aviableMemerySize*0.9;
+        // 20% memery for run time
+        final double hashMapLimit =  aviableMemerySize*0.8;
         int fileNumber = (int) (Math.ceil((double) fileLength/ (double) hashMapLimit));
-        //记录hash表占用的内存大小
+        System.out.println( sourceFilePath + " split to " + fileNumber +" files");
+        //use to record size of hashMap
         long hashMapSize = 0L;
 
         List < Closeable[]> list  = getBufferWriters(fileSplitDir, fileNumber, "split_");
@@ -57,12 +58,11 @@ public class FileUtil {
                 }
                 if (cacheMap.get(url) == null && hashMapSize < hashMapLimit) {
                     cacheMap.put(url, count);
-                    //计算每条记录占用的内存大小= url的长度 + length (long) + hashcoe(int型) + 对象头 + key对象引用
+                    //size if record = length(url) + length (long) + length(hashcode) + length(markword) + length(referance)
                     //TODO 自定义hashtable, 使用数组存放hashtable,避免对象头，和指针引用造成的空间占用
                     hashMapSize += (long) url.length() + 8L + 4L + 16L + 4L;
 
                 } else if (cacheMap.get(url) != null && hashMapSize < hashMapLimit) {
-                    //这里只是更新map中数据，无需更新内存占用
                     cacheMap.put(url, cacheMap.get(url) + count);
                 }
 
@@ -71,18 +71,18 @@ public class FileUtil {
                         int number = Math.abs(entry.getKey().hashCode()% fileNumber);
                         WriteToFile(entry.getKey(), entry.getValue(), bws[number]);
                     }
-                    //写出后清空缓存信息
+                    //clear the map after write it`s content
                     cacheMap.clear();
                     hashMapSize = 0;
                 }
             }
-            //写出最后一部分数据，
-            // TODO 这里有一个优化点，如果在遍历完源文件后，内存空间始终够用,即url的基数比较低的情况，是可以直接进行统计的
+            //
+            // TODO map be we can add a flag to infer wheather the map can hold all record
             for (Map.Entry<String, Long> entry : cacheMap.entrySet()) {
                 int number = Math.abs(entry.getKey().hashCode()% fileNumber);
                 WriteToFile(entry.getKey(), entry.getValue(), bws[number]);
             }
-            //写出后清空缓存信息
+
             cacheMap.clear();
             hashMapSize = 0;
 
@@ -94,8 +94,8 @@ public class FileUtil {
             closeReaders(reader);
         }
 
-        //每次按分割完文件后，可能存在数据倾斜，某个split文件特别大，需要再次分割
-        //这里使用递归完成文件的分割
+        // after split the sourcefile , there may be data skew, the splits still unmatch
+        // the memery size ,so we split file recursively until it macth the size;
         File file = new File(fileSplitDir);
         FilenameFilter filter = new FilenameFilter() {
             public boolean accept(File dir, String name) {
@@ -111,9 +111,9 @@ public class FileUtil {
 
         for (int i = 0; i <splitFiles.length ; i++) {
             if (splitFiles[i].length() > hashMapLimit && splitFiles[i].isFile() ) {
-                splitFile(fileSplitDir + File.separator + splitFiles[i].getName(), aviableMemerySize,
+                splitFile(splitFiles[i].getAbsolutePath(), aviableMemerySize,
                         splitFiles[i].getAbsolutePath()+ "__");
-                //这里有可能删除文件失败，通过改名，废弃掉被二次划分的的文件文件
+                //in case of delete file failed , rename file to avoid error result
                 if (!splitFiles[i].delete()) {
                    try {
                        splitFiles[i].renameTo(new File(splitFiles[i].getAbsoluteFile() + ".old"));
@@ -130,12 +130,211 @@ public class FileUtil {
 
     }
 
+
+    //produceer-consumer mode to deal with big file i/o, a single thread for read, and a single thread for write
+    private static Map<String, Long> mapReadin = new HashMap();
+    private static Map<String,Long> mapWriteOut = new HashMap();
+    private static Map tmp ;
+    private static volatile boolean isReadin;
+    private static volatile boolean isWriteout;
+    private static volatile boolean completed;
+    private static ReentrantLock lock = new ReentrantLock();
+    private static Condition writeCondition = lock.newCondition();
+    private static Condition readCondition = lock.newCondition();
+
     /**
-     * 将单个文件聚合排序
-     * @param filename
-     * @return
+     * a single thread for write intermedia result to splited file
      */
-    public static Map sortFile(String filename) {
+    public static void fileSplitWriter(String sourceFilePath, long aviableMemerySize, String destDirName ) {
+        File  soureFile = new File(sourceFilePath);
+        String fileSplitDir =  destDirName;
+        File destDir = new File(fileSplitDir);
+        if (destDir.exists()) {
+            destDir.delete();
+        }
+        destDir.mkdirs();
+
+        long fileLength = soureFile.length();
+        // 20% memery for run time
+        final double hashMapLimit =  aviableMemerySize*0.8;
+        int fileNumber = (int) (Math.ceil((double) fileLength/ (double) hashMapLimit));
+        System.out.println( sourceFilePath + " split to " + fileNumber +" files");
+        //use to record size of hashMap
+        long hashMapSize = 0L;
+
+        List < Closeable[]> list  = getBufferWriters(fileSplitDir, fileNumber, "split_");
+        BufferedWriter bws[] = (BufferedWriter[]) list.get(0);
+        while (true) {
+            lock.lock();
+            try {
+                while (mapWriteOut.isEmpty()) {
+                    if (isReadin) {
+                        writeCondition.await();
+                    }
+                    readCondition.signal();
+                    if (completed && mapWriteOut.isEmpty()) {
+                        closeWriters(list);
+                        return;
+                    }
+
+                }
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+                throw  new RuntimeException("write thread Interrupted");
+            }
+
+            finally {
+                lock.unlock();
+            }
+            isWriteout = true;
+            System.out.println("mapWriteOut size : "+ mapWriteOut.size() );
+
+            for (Map.Entry<String, Long> entry: mapWriteOut.entrySet()) {
+                int number = Math.abs(entry.getKey().hashCode()% fileNumber);
+                WriteToFile(entry.getKey(), entry.getValue(), bws[number]);
+            }
+            mapWriteOut.clear();
+            isWriteout = false;
+        }
+
+    }
+
+    /**
+     * a single thread reader that read record from source file;
+     * @param sourceFilePath
+     * @param aviableMemerySize
+     */
+    public static  void fileSplitReader(String sourceFilePath, long aviableMemerySize) {
+        File  soureFile = new File(sourceFilePath);
+
+
+        long fileLength = soureFile.length();
+        // 20% memery for run time
+        final double hashMapLimit =  Math.ceil(aviableMemerySize*0.8);
+        //use to record size of hashMap
+        long hashMapSize = 0L;
+
+        BufferedReader reader = getReader(sourceFilePath);
+        String line = null;
+
+        while (true) {
+            lock.lock();
+            try {
+                while (!mapReadin.isEmpty()) {
+                    if (isWriteout) {
+                        readCondition.await();
+                    }
+                    tmp = mapWriteOut;
+                    mapWriteOut = mapReadin;
+                    mapReadin = tmp;
+                    writeCondition.signal();
+                }
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+                throw new RuntimeException("read thread been Interrupted");
+            } finally {
+                lock.unlock();
+            }
+            if(completed) {
+                break;
+            }
+
+            try {
+                while ((line = reader.readLine())!= null){
+                    isReadin = true;
+                    if (line.length() == 0) {
+                        continue;
+                    }
+                    String word[] = line.split(" ");
+                    String url = word[0];
+                    long count = 1;
+                    int urlLength = url.length();
+
+                    if (word.length > 1) {
+                        count = Long.parseLong(word[1]);
+                    }
+                    if (mapReadin.get(url) == null && hashMapSize < hashMapLimit) {
+                        mapReadin.put(url, count);
+                        hashMapSize += (long) url.length() + 8L + 4L + 16L + 4L;
+
+                    } else if (mapReadin.get(url) != null && hashMapSize < hashMapLimit) {
+                        mapReadin.put(url, mapReadin.get(url) + count);
+                    }
+
+                    if (hashMapSize >= hashMapLimit) {
+                        hashMapSize = 0L;
+                        isReadin = false;
+                        break;
+                    }
+                }
+
+                if (line == null) {
+                    isReadin = false;
+                    completed = true;
+                    continue;
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+
+        }
+    }
+
+    public static void splitFileWithMultiThread(final String sourceFilePath, final long aviableMemerySize,
+                                         final String destDirName) {
+        Runnable writer = new Runnable() {
+            public void run() {
+                fileSplitWriter(sourceFilePath,  aviableMemerySize,  destDirName);
+            }
+        };
+        Thread t = new Thread(writer);
+        t.start();
+        fileSplitReader(sourceFilePath,  aviableMemerySize);
+        try {
+            t.join();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+            throw  new RuntimeException("wait reader interrupted");
+        }
+        // deal with data skew
+        File file = new File(destDirName);
+        FilenameFilter filter = new FilenameFilter() {
+            public boolean accept(File dir, String name) {
+                if (name.endsWith(".old")) {
+                    return false;
+                } else {
+                    return true;
+                }
+            }
+        };
+
+        File splitFiles[] = file.listFiles(filter);
+        final double hashMapLimit =  aviableMemerySize*0.8;
+
+        for (int i = 0; i <splitFiles.length ; i++) {
+            if (splitFiles[i].length() > hashMapLimit && splitFiles[i].isFile() ) {
+                splitFile(splitFiles[i].getAbsolutePath(), aviableMemerySize,
+                        splitFiles[i].getAbsolutePath()+ "__");
+                //in case of delete file failed , rename file to avoid error result
+                if (!splitFiles[i].delete()) {
+                    try {
+                        splitFiles[i].renameTo(new File(splitFiles[i].getAbsoluteFile() + ".old"));
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+
+        }
+
+    }
+
+    /**
+     * merge duplicate key
+     * @param filename
+     * @return  map with sort key
+     */
+    public static Map aggKey(String filename) {
         cacheMap.clear();
         BufferedReader reader = getReader(filename);
         String line = null;
@@ -143,7 +342,10 @@ public class FileUtil {
             while ((line = reader.readLine()) != null) {
                 String word[] = line.split(" ");
                 String url = word[0];
-                long count = Long.parseLong(word[1]);
+                long count = 1;
+                if (word.length == 2) {
+                     count = Long.parseLong(word[1]);
+                }
 
                 if (cacheMap.get(url) == null) {
                     cacheMap.put(url, count);
@@ -164,7 +366,7 @@ public class FileUtil {
     }
 
     /**
-     * 获取一个map中的topn
+     *
      * @param map
      * @param queue
      * @return
@@ -190,7 +392,7 @@ public class FileUtil {
         File splitFiles[] = new File(splitDir).listFiles(filter) ;
         for (int i = 0; i < splitFiles.length; i++) {
             if (splitFiles[i].isFile()) {
-                Map<String, Long> map = sortFile(splitFiles[i].getAbsolutePath());
+                Map<String, Long> map = aggKey(splitFiles[i].getAbsolutePath());
                 queue = getTopNfromMap(map, queue);
             } else {
                 getTopN(splitFiles[i].getAbsolutePath(), queue);
@@ -201,10 +403,10 @@ public class FileUtil {
 
 
     /**
-     * 获取一组writer
-     * @param fileSplitDir
-     * @param fileNumber
-     * @return
+     * get the split file fd
+     * @param fileSplitDir  split dir
+     * @param fileNumber number of file
+     * @return list of file fd
      */
     public static List<Closeable[]> getBufferWriters(String fileSplitDir, int fileNumber, String dirFlag) {
 
@@ -237,7 +439,7 @@ public class FileUtil {
     }
 
     /**
-     * 关闭一组writer
+     * close a list of file fd
      * @param list
      */
     public static void closeWriters(List< Closeable[]> list) {
@@ -252,6 +454,10 @@ public class FileUtil {
         }
     }
 
+    /**
+     * close a list of file fd
+     * @param readers
+     */
     public static void closeReaders(BufferedReader ... readers) {
         for (int i = 0; i < readers.length ; i++) {
             if (readers[i] != null) {

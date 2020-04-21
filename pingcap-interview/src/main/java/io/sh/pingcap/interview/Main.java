@@ -26,7 +26,7 @@ public class Main {
         try {
             for (int i = 0; i < count; i++) {
                 int num = random.nextInt(urls.length - 1);
-                String string = urls[num] + random.nextInt()%100000;
+                String string = urls[num] + random.nextInt()%1000;
                 writer.append(string);
                 writer.newLine();
 
@@ -41,7 +41,7 @@ public class Main {
         long time = (System.currentTimeMillis() - startTime ) / 1000;
         System.out.println("generate test file success, spend " );
         System.out.print(time);
-        System.out.print("  second");
+        System.out.println("  second");
 
     }
 
@@ -52,14 +52,21 @@ public class Main {
         return queue;
     }
 
+    public static TopnQueue getTopN2(String sourceFile, String splitDir, long aviableMemerySize , int topn) {
+        FileUtil.splitFileWithMultiThread(sourceFile, aviableMemerySize, splitDir);
+        TopnQueue topnQueue = new TopnQueue(topn);
+        TopnQueue  queue= FileUtil.getTopN(splitDir, topnQueue);
+        return queue;
+    }
+
     /**
-     * 程序主入口
-     * 参数：
-     *     args[0] 待计算的大文件名称（全路径）
-     *     args[1] 存放中间结果的临时目录（全路径）
-     *     args[2] 可用的内存
-     *     args[3] 取前多少个元素
+     *
      * @param args
+     *     args[0] sourcefilename
+     *     args[1] tmp path
+     *     args[2] aviable memory size
+     *     args[3] topn
+     *
      */
     public static void main(String args[]) {
         if (args.length != 4) {
